@@ -8,7 +8,6 @@ import type { LinkPreviewWithHydratedData } from '../types/message/LinkPreviews.
 import type {
   LinkPreviewImage,
   LinkPreviewResult,
-  LinkPreviewSourceType,
   MaybeGrabLinkPreviewOptionsType,
   AddLinkPreviewOptionsType,
 } from '../types/LinkPreview.std.ts';
@@ -48,6 +47,7 @@ import {
   fetchLinkPreviewMetadata,
 } from '../textsecure/WebAPI.preload.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
+import { LinkPreviewSourceType } from '../types/LinkPreview.std.ts';
 
 const { debounce, omit } = lodash;
 
@@ -59,7 +59,14 @@ const LINK_PREVIEW_TIMEOUT = 60 * SECOND;
 let currentlyMatchedLink: string | undefined;
 let disableLinkPreviews = false;
 let excludedPreviewUrls: Array<string> = [];
-let linkPreviewAbortController: AbortController | undefined;
+let linkPreviewRequest:
+  | {
+      abortController: AbortController;
+      result: Promise<LinkPreviewResult | null>;
+      conversationId: string | undefined;
+      source: LinkPreviewSourceType;
+    }
+  | undefined;
 let linkPreviewResult: Array<LinkPreviewResult> | undefined;
 
 export function suspendLinkPreviews(): void {
@@ -139,8 +146,8 @@ export function removeLinkPreview(conversationId?: string): void {
   });
   linkPreviewResult = undefined;
   currentlyMatchedLink = undefined;
-  linkPreviewAbortController?.abort();
-  linkPreviewAbortController = undefined;
+  linkPreviewRequest?.abortController.abort();
+  linkPreviewRequest = undefined;
 
   window.reduxActions.linkPreviews.removeLinkPreview(conversationId);
 }
@@ -164,15 +171,14 @@ async function addLinkPreview(
   linkPreviewResult = undefined;
 
   // Cancel other in-flight link preview requests.
-  if (linkPreviewAbortController) {
+  if (linkPreviewRequest) {
     log.info(
       'addLinkPreview: canceling another in-flight link preview request'
     );
-    linkPreviewAbortController.abort();
+    linkPreviewRequest.abortController.abort();
   }
 
   const thisRequestAbortController = new AbortController();
-  linkPreviewAbortController = thisRequestAbortController;
 
   const timeout = setTimeout(() => {
     thisRequestAbortController.abort();
@@ -189,17 +195,26 @@ async function addLinkPreview(
     conversationId
   );
 
+  const request = {
+    abortController: thisRequestAbortController,
+    conversationId,
+    source,
+    result: disableFetch
+      ? Promise.resolve<LinkPreviewResult>({
+          title: null,
+          url,
+          description: null,
+          date: null,
+        })
+      : getPreview(url, thisRequestAbortController.signal),
+  };
+  linkPreviewRequest = request;
+
   try {
-    let result: LinkPreviewResult | null;
-    if (disableFetch) {
-      result = {
-        title: null,
-        url,
-        description: null,
-        date: null,
-      };
-    } else {
-      result = await getPreview(url, thisRequestAbortController.signal);
+    const result = await request.result;
+
+    if (linkPreviewRequest !== request) {
+      return;
     }
 
     if (!result) {
@@ -247,6 +262,9 @@ async function addLinkPreview(
     );
     linkPreviewResult = [result];
   } catch (error) {
+    if (linkPreviewRequest !== request) {
+      return;
+    }
     log.error(
       'Problem loading link preview, disabling.',
       Errors.toLogFormat(error)
@@ -256,6 +274,61 @@ async function addLinkPreview(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export function takePendingLinkPreview(
+  message: string,
+  conversationId: string
+):
+  | { result: Promise<Array<LinkPreviewWithHydratedData>>; abort: () => void }
+  | undefined {
+  maybeGrabLinkPreview.cancel();
+  _maybeGrabLinkPreview(message, LinkPreviewSourceType.Composer, {
+    conversationId,
+  });
+
+  const request = linkPreviewRequest;
+  if (
+    linkPreviewResult ||
+    !getLinkPreviewSetting() ||
+    disableLinkPreviews ||
+    !request ||
+    request.conversationId !== conversationId ||
+    request.source !== LinkPreviewSourceType.Composer ||
+    request.abortController.signal.aborted
+  ) {
+    return;
+  }
+
+  linkPreviewRequest = undefined;
+  currentlyMatchedLink = undefined;
+  const urlsInMessage = new Set(LinkPreview.findLinks(message));
+  const finishPreview = async (): Promise<
+    Array<LinkPreviewWithHydratedData>
+  > => {
+    try {
+      const result = await request.result;
+      if (
+        request.abortController.signal.aborted ||
+        !result ||
+        !urlsInMessage.has(result.url) ||
+        (!result.title && !result.image?.data)
+      ) {
+        return [];
+      }
+      return [sanitizeLinkPreview(result)];
+    } catch (error) {
+      log.error(
+        'Problem loading pending link preview',
+        Errors.toLogFormat(error)
+      );
+      return [];
+    }
+  };
+  return {
+    abort: () => request.abortController.abort(),
+    result: finishPreview(),
+  };
 }
 
 export function getLinkPreviewForSend(
