@@ -34,6 +34,7 @@ import { modifyTargetMessage } from './modifyTargetMessage.preload.ts';
 import { isMessageNoteToSelf } from './isMessageNoteToSelf.dom.ts';
 import { MessageModel } from '../models/messages.preload.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
+import { calculateExpirationTimestamp } from './expirationTimer.std.ts';
 
 const log = createLogger('handleEditMessage');
 
@@ -44,16 +45,16 @@ export async function handleEditMessage(
   editAttributes: Pick<
     EditAttributesType,
     'message' | 'conversationId' | 'fromDevice' | 'fromId'
-  >,
+  > & { isLinkPreviewUpdate?: boolean },
   recursionCount = 0
-): Promise<void> {
+): Promise<boolean> {
   const idLog = `handleEditMessage(edit=${
     editAttributes.message.timestamp
   },original=${getMessageIdForLogging(mainMessage)})`;
 
   if (recursionCount >= RECURSION_LIMIT) {
     log.warn(`${idLog}: Too much recursion`);
-    return;
+    return false;
   }
 
   log.info(idLog);
@@ -64,29 +65,29 @@ export async function handleEditMessage(
     : mainMessage.sourceServiceId;
   if (!isAciString(senderAci)) {
     log.warn(`${idLog}: Cannot edit a message from PNI source`);
-    return;
+    return false;
   }
 
   // Verify that we can safely apply an edit to this type of message
   if (mainMessage.deletedForEveryone) {
     log.warn(`${idLog}: Cannot edit a DOE message`);
-    return;
+    return false;
   }
 
   if (mainMessage.isViewOnce) {
     log.warn(`${idLog}: Cannot edit an isViewOnce message`);
-    return;
+    return false;
   }
 
   if (mainMessage.contact && mainMessage.contact.length > 0) {
     log.warn(`${idLog}: Cannot edit a contact share`);
-    return;
+    return false;
   }
 
   const hasVoiceMessage = mainMessage.attachments?.some(isVoiceMessage);
   if (hasVoiceMessage) {
     log.warn(`${idLog}: Cannot edit a voice message`);
-    return;
+    return false;
   }
 
   const { serverTimestamp } = editAttributes.message;
@@ -97,7 +98,7 @@ export async function handleEditMessage(
     isTooOldToEditMessage(serverTimestamp, mainMessage)
   ) {
     log.warn(`${idLog}: cannot edit message older than 48h`, serverTimestamp);
-    return;
+    return false;
   }
 
   const mainMessageModel = window.MessageCache.register(
@@ -131,12 +132,35 @@ export async function handleEditMessage(
   );
   if (editedMessageExists) {
     log.warn(`${idLog}: edited message is duplicate. Dropping.`);
-    return;
+    return false;
   }
 
   const upgradedEditedMessageData = await upgradeMessageSchema(
     editAttributes.message
   );
+
+  if (editAttributes.isLinkPreviewUpdate) {
+    if (
+      window.MessageCache.getById(mainMessage.id) !== mainMessageModel ||
+      mainMessageModel.get('deletedForEveryone') ||
+      mainMessageModel.get('editHistory')?.length ||
+      mainMessageModel.get('body') !== mainMessage.body ||
+      mainMessageModel.get('preview')?.length ||
+      (mainMessageModel.get('expireTimer') &&
+        (calculateExpirationTimestamp(mainMessageModel.attributes) ??
+          Infinity) <= Date.now())
+    ) {
+      return false;
+    }
+
+    editHistory = editHistory.map(edit => ({
+      ...edit,
+      bodyAttachment: mainMessageModel.get('bodyAttachment'),
+      sendStateByConversationId: {
+        ...mainMessageModel.get('sendStateByConversationId'),
+      },
+    }));
+  }
 
   const incomingPreview = upgradedEditedMessageData.preview ?? [];
   const validatedPreview = getValidLinkPreviews(
@@ -332,4 +356,5 @@ export async function handleEditMessage(
       handleEditMessage(mainMessageModel.attributes, edit, recursionCount + 1)
     )
   );
+  return true;
 }

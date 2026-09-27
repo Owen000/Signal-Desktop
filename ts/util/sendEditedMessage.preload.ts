@@ -41,6 +41,7 @@ import { timeAndLogIfTooLong } from './timeAndLogIfTooLong.std.ts';
 import { makeQuote } from './makeQuote.preload.ts';
 import { getMessageSentTimestamp } from './getMessageSentTimestamp.std.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
+import { getLinkPreviewSetting } from './Settings.preload.ts';
 
 const log = createLogger('sendEditedMessage');
 
@@ -55,6 +56,7 @@ export async function sendEditedMessage(
     quoteSentAt,
     quoteAuthorAci,
     targetMessageId,
+    linkPreviewOnly = false,
   }: {
     body?: string;
     bodyRanges?: DraftBodyRanges;
@@ -62,6 +64,7 @@ export async function sendEditedMessage(
     quoteSentAt?: number;
     quoteAuthorAci?: AciString;
     targetMessageId: string;
+    linkPreviewOnly?: boolean;
   }
 ): Promise<void> {
   const conversation = window.ConversationController.get(conversationId);
@@ -72,6 +75,23 @@ export async function sendEditedMessage(
   )})`;
 
   const targetMessage = await getMessageById(targetMessageId);
+  if (linkPreviewOnly) {
+    if (
+      !targetMessage ||
+      !getLinkPreviewSetting() ||
+      !preview.length ||
+      targetMessage.get('attachments')?.length ||
+      targetMessage.get('body') !== body ||
+      targetMessage.get('contact')?.length ||
+      targetMessage.get('conversationId') !== conversationId ||
+      targetMessage.get('editHistory')?.length ||
+      targetMessage.get('isViewOnce') ||
+      targetMessage.get('preview')?.length ||
+      !canEditMessage(targetMessage.attributes)
+    ) {
+      return;
+    }
+  }
   strictAssert(targetMessage, 'could not find message to edit');
 
   if (isGroupV1(conversation.attributes)) {
@@ -94,7 +114,9 @@ export async function sendEditedMessage(
     );
   }
 
-  const timestamp = Date.now();
+  const timestamp = linkPreviewOnly
+    ? Math.max(Date.now(), targetMessage.get('timestamp') + 1)
+    : Date.now();
   const targetSentTimestamp = getMessageSentTimestamp(
     targetMessage.attributes,
     {
@@ -104,10 +126,18 @@ export async function sendEditedMessage(
 
   log.info(`${idLog}: edited(${timestamp}) original(${targetSentTimestamp})`);
 
-  conversation.clearTypingTimers();
+  if (!linkPreviewOnly) {
+    conversation.clearTypingTimers();
+  }
 
-  let quote: QuotedMessageType | undefined;
-  if (quoteSentAt !== undefined && quoteAuthorAci !== undefined) {
+  let quote: QuotedMessageType | undefined = linkPreviewOnly
+    ? targetMessage.get('quote')
+    : undefined;
+  if (
+    !linkPreviewOnly &&
+    quoteSentAt !== undefined &&
+    quoteAuthorAci !== undefined
+  ) {
     const existingQuote = targetMessage.get('quote');
 
     // Keep the quote if unchanged.
@@ -161,7 +191,7 @@ export async function sendEditedMessage(
   const tmpMessage: MessageAttributesType = {
     attachments: originalAttachments,
     body,
-    bodyRanges,
+    bodyRanges: linkPreviewOnly ? targetMessage.get('bodyRanges') : bodyRanges,
     conversationId,
     preview: previewToSend,
     id: generateUuid(),
@@ -176,12 +206,16 @@ export async function sendEditedMessage(
 
   // Takes care of putting the message in the edit history, replacing the
   // main message's values, and updating the conversation's properties.
-  await handleEditMessage(targetMessage.attributes, {
+  const applied = await handleEditMessage(targetMessage.attributes, {
     conversationId,
     fromId,
     fromDevice: itemStorage.user.getDeviceId() ?? 1,
     message: tmpMessage,
+    isLinkPreviewUpdate: linkPreviewOnly,
   });
+  if (linkPreviewOnly && !applied) {
+    return;
+  }
 
   // Reset send state prior to send
   targetMessage.set({ sendStateByConversationId });
@@ -209,6 +243,10 @@ export async function sendEditedMessage(
       ),
     duration => `${idLog}: db save took ${duration}ms`
   );
+
+  if (linkPreviewOnly) {
+    return;
+  }
 
   // Does the same render dance that models/conversations does when we call
   // enqueueMessageForSend. Calls redux actions, clears drafts, unarchives, and
