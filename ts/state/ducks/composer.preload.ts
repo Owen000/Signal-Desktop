@@ -58,6 +58,7 @@ import {
   removeLinkPreview,
   resetLinkPreview,
   suspendLinkPreviews,
+  takePendingLinkPreview,
 } from '../../services/LinkPreview.preload.ts';
 import {
   getAttachmentSizeLimit,
@@ -710,8 +711,13 @@ function sendMultiMediaMessage(
           ? shouldSendHighQualityAttachments
           : state.items['sent-media-quality'] === 'high';
 
+      const pendingPreview =
+        attachments.length || isViewOnce
+          ? undefined
+          : takePendingLinkPreview(message, conversationId);
+
       try {
-        await conversation.enqueueMessageForSend(
+        const sentMessage = await conversation.enqueueMessageForSend(
           {
             body: message,
             attachments,
@@ -746,7 +752,33 @@ function sendMultiMediaMessage(
             },
           }
         );
+
+        if (sentMessage && pendingPreview) {
+          const finishPreview = async () => {
+            try {
+              const preview = await pendingPreview.result;
+              if (!preview.length) {
+                return;
+              }
+              await doSendEditedMessage(conversationId, {
+                targetMessageId: sentMessage.id,
+                body: message,
+                preview,
+                linkPreviewOnly: true,
+              });
+            } catch (error) {
+              log.error(
+                'Error adding preview to sent message',
+                Errors.toLogFormat(error)
+              );
+            }
+          };
+          drop(finishPreview());
+        } else {
+          pendingPreview?.abort();
+        }
       } catch (error) {
+        pendingPreview?.abort();
         log.error(
           'Error pulling attached files before send',
           Errors.toLogFormat(error)
